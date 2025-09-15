@@ -113,7 +113,9 @@ class LlamaVisionChat(lmms):
         self.image_processor = AutoImageProcessor.from_pretrained("BAAI/Emu3-VisionTokenizer", trust_remote_code=True)
         self.image_tokenizer = EMU3ImageOnlyTokenizer(
             text_tokenizer_path="/capstor/store/cscs/swissai/infra01/MLLM/llama3_emu3_tokenizer",
-            device=self._device
+            device=self._device,
+            min_pixels=512 * 512,
+            max_pixels=1024 * 1024,
         )
         self._tokenizer = AutoTokenizer.from_pretrained("/capstor/store/cscs/swissai/infra01/MLLM/llama3_emu3_tokenizer")
         self.system_prompt = system_prompt
