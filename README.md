@@ -4,6 +4,8 @@
 
 # The Evaluation Suite of Large Multimodal Models 
 
+This is a Fork implementing a unified multimodal large language model, and has NOT been properly tested yet.
+
 [![PyPI](https://img.shields.io/pypi/v/lmms-eval)](https://pypi.org/project/lmms-eval)
 ![PyPI - Downloads](https://img.shields.io/pypi/dm/lmms-eval)
 [![GitHub contributors](https://img.shields.io/github/contributors/EvolvingLMMs-Lab/lmms-eval)](https://github.com/EvolvingLMMs-Lab/lmms-eval/graphs/contributors)
