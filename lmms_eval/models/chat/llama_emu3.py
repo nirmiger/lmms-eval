@@ -39,13 +39,9 @@ sys.path.append(tokenizer_path)
 from vision_tokenization.utils.tokenization_emu3_image_only import EMU3ImageOnlyTokenizer
 
 
-@register_model("llama_vision")
-class LlamaVisionChat(lmms):
+@register_model("llama_emu3")
+class LlamaEmu3Chat(lmms):
     is_simple = False
-    """
-    Qwen2.5_VL Model
-    "https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct"
-    """
 
     def __init__(
         self,
@@ -186,7 +182,7 @@ class LlamaVisionChat(lmms):
         return self._world_size
 
     def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
-        raise NotImplementedError("Loglikelihood is not implemented for Qwen2.5_VL")
+        raise NotImplementedError("Loglikelihood is not implemented for llama_emu3 model.")
 
     def flatten(self, input):
         new_list = []
@@ -211,11 +207,7 @@ class LlamaVisionChat(lmms):
         pbar = tqdm(total=num_iters, disable=(self.rank != 0), desc="Model Responding")
         e2e_latency = 0
         total_tokens = 0
-        import json
 
-        debug_file_path = "debug_tokenization.json"
-        debug_data = {}
-        debug_done = True
         for chunk in chunks:
             ctx, doc_to_messages, all_gen_kwargs, doc_id, task, split = zip(*chunk)
             chat_messages = [doc_to_messages[0](self.task_dict[task][split][ids]) for ids, task, split in zip(doc_id, task, split)]
@@ -253,19 +245,16 @@ class LlamaVisionChat(lmms):
                             # insert a placeholder to replace with image tokens
                             msg_text.append("<image>")
                 texts.append(" ".join(msg_text))
-            if not debug_done:
-                debug_data["text"] = texts[0]
+
             # Replace <image> markers with actual image token strings
             processed_texts = []
             for txt in texts:
                 for token_str in image_token_strs:
                     txt = txt.replace("<image>", token_str, 1)
                 processed_texts.append(txt)
-            if not debug_done:
-                debug_data["processed_text"] = processed_texts[0]
+
             inputs = self._tokenizer(processed_texts, padding=False, return_tensors="pt")
-            if not debug_done:
-                debug_data["input_ids"] = inputs.input_ids[0].tolist()
+
             if self.device_map == "auto":
                 inputs = inputs.to("cuda")
             else:
@@ -305,11 +294,7 @@ class LlamaVisionChat(lmms):
 
             generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, cont)]
             answers = self._tokenizer.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-            if not debug_done:
-                debug_data["answer"] = answers[0]
-                with open(debug_file_path, "w", encoding="utf-8") as f:
-                    json.dump(debug_data, f, indent=2, ensure_ascii=False)
-                debug_done = True
+
             # Calculate timing metrics for batch
             e2e_latency += end_time - start_time
             total_tokens += sum(len(ids) for ids in generated_ids_trimmed)

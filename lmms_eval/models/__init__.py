@@ -88,7 +88,7 @@ AVAILABLE_CHAT_TEMPLATE_MODELS = {
     "sglang": "Sglang",
     "huggingface": "Huggingface",
     "async_openai": "AsyncOpenAIChat",
-    "llama_vision": "LlamaVisionChat",
+    "llama_emu3": "LlamaEmu3Chat",
 }
 
 
