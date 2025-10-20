@@ -7,7 +7,11 @@ import torch
 # from decord import VideoReader, cpu
 from PIL import Image
 from pydantic import BaseModel
-from qwen_vl_utils import fetch_video
+
+try:
+    from qwen_vl_utils import fetch_video
+except ImportError:
+    fetch_video = None
 
 
 class ChatTextContent(BaseModel):
@@ -60,7 +64,6 @@ class ChatMessages(BaseModel):
     def to_hf_messages(self, video_kwargs: Dict[str, str] = None):
         if video_kwargs is None:
             video_kwargs = {}
-        enforce_images = video_kwargs.pop("enforce_images", False)
         num_frames = video_kwargs.get("nframes", 32)
         hf_messages = []
         for message in self.messages:
@@ -71,18 +74,13 @@ class ChatMessages(BaseModel):
                 elif content.type == "image":
                     hf_message["content"].append({"type": "image", "image": content.url})
                 elif content.type == "video":
-                    # Note this is a hacky way if you want to do video in multi-images way
-                    if enforce_images:
-                        for f in range(num_frames):
-                            hf_message["content"].append({"type": "image"})
-                    else:
-                        hf_message["content"].append({"type": "video", "video": content.url, **video_kwargs})
+                    hf_message["content"].append({"type": "video", "video": content.url, **video_kwargs})
                 elif content.type == "audio":
                     hf_message["content"].append({"type": "audio", "audio": content.url})
             hf_messages.append(hf_message)
         return hf_messages
 
-    def to_openai_messages(self, video_kwargs: Dict[str, str] = None):
+    def to_openai_messages(self, video_kwargs: Dict[str, str] = {}):
         openai_messages = []
         for message in self.messages:
             openai_message = {"role": message.role, "content": []}
@@ -92,6 +90,8 @@ class ChatMessages(BaseModel):
                 elif content.type == "image":
                     openai_message["content"].append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{self.encode_image(content.url)}"}})
                 elif content.type == "video":
+                    if fetch_video is None:
+                        raise ImportError("qwen_vl_utils is required for video processing. Please install it with: pip install qwen-vl-utils")
                     video_input = fetch_video({"type": "video", "video": content.url, **video_kwargs})
                     for frame in video_input:
                         image = Image.fromarray(frame.permute(1, 2, 0).numpy().astype(np.uint8))

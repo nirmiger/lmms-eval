@@ -55,6 +55,7 @@ class AsyncOpenAIChat(lmms):
         work_dir: str = None,
         fps: Optional[int] = None,
         nframes: Optional[int] = 64,
+        max_frames: Optional[int] = None,
         max_pixels: Optional[int] = 151200,
         min_pixels: Optional[int] = 28 * 28,
         **kwargs,
@@ -76,6 +77,7 @@ class AsyncOpenAIChat(lmms):
         self.client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url, timeout=timeout)
         self.max_pixels = max_pixels
         self.min_pixels = min_pixels
+        self.max_frames = max_frames
         if mcp_server_path is not None:
             self.mcp_client = MCPClient(mcp_server_path)
             os.makedirs(self.work_dir, exist_ok=True)
@@ -138,6 +140,8 @@ class AsyncOpenAIChat(lmms):
             video_kwargs["fps"] = self.fps
         else:
             video_kwargs["nframes"] = self.nframes
+        if self.max_frames is not None:
+            video_kwargs["max_frames"] = self.max_frames
         messages = chat_messages.to_openai_messages(video_kwargs)
         images, videos, audios = chat_messages.extract_media()
         if self.mcp_client is not None:
@@ -172,7 +176,11 @@ class AsyncOpenAIChat(lmms):
 
         response = await self.client.chat.completions.create(**payload)
         last_response = response.choices[0].message.content
-        all_response += last_response
+        # Sometimes asyncio return None, skip this case
+        try:
+            all_response += last_response
+        except Exception as e:
+            all_response += f"Error: {str(e)}"
 
         while response.choices[0].finish_reason == "tool_calls":
             messages.append({"role": "assistant", "content": last_response})
@@ -184,11 +192,17 @@ class AsyncOpenAIChat(lmms):
                 for call in message.tool_calls:
                     eval_logger.debug(f"Calling {call.function.name}...")
                     result = await self.mcp_client.run_tool(call.function.name, eval(call.function.arguments))
-                    all_response += f"<tool_call>{call.function.name} {call.function.arguments}</tool_call>"
+                    all_response += f"<tool_call>{call.function.name} {call.function.arguments}</tool_call></tool_response>"
                     tool_messages.append({"role": "tool", "name": call.function.name, "content": []})
                     for content in result.content:
                         tool_message = self.mcp_client.convert_result_to_openai_format(content)
+                        for content in tool_message:
+                            if content["type"] == "image_url":
+                                all_response += "<image_url>"
+                            elif content["type"] == "text":
+                                all_response += content["text"]
                         tool_messages[-1]["content"].extend(tool_message)
+                    all_response += "</tool_response>"
 
             response = await self.client.chat.completions.create(
                 model=self.model_version,
@@ -199,7 +213,10 @@ class AsyncOpenAIChat(lmms):
                 tool_choice="auto",
             )
             last_response = response.choices[0].message.content
-            all_response += last_response
+            try:
+                all_response += last_response
+            except Exception as e:
+                all_response += str(e)
         self.add_request_response_to_cache(request, all_response)
         return all_response, idx
 
