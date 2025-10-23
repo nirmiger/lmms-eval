@@ -34,13 +34,21 @@ from lmms_eval.protocol import ChatMessages
 import sys
 import os
 
-tokenizer_path = "/iopsstor/scratch/cscs/nirmiger/benchmark-image-tokenzier"
+# refer to swissai specific repositories on clariden
+user = os.environ["USER"]
+tokenizer_path = f"/iopsstor/scratch/cscs/{user}/benchmark-image-tokenzier"
 sys.path.append(tokenizer_path)
 from vision_tokenization.utils.tokenization_emu3_image_only import EMU3ImageOnlyTokenizer
 
 
 @register_model("llama_emu3")
 class LlamaEmu3Chat(lmms):
+    """
+    Integration of a llama3.2-3B model with a unified multi-modal early fusion approach. Model Vocabulary is extended to include image tokens.
+    Emu3 tokenizer is used to convert images to discrete tokens.
+
+    Part of the code is based on chat/qwen2_5_vl.py
+    """
     is_simple = False
 
     def __init__(
@@ -51,31 +59,24 @@ class LlamaEmu3Chat(lmms):
         batch_size: Optional[Union[int, str]] = 1,
         use_cache=True,
         attn_implementation: Optional[str] = None,
-        max_num_frames: int = 32,
-        use_custom_video_loader: Optional[bool] = False,
-        fps: Optional[float] = None,  # Only applicable if use_custom_video_loader is True
-        max_image_size: Optional[int] = None,  # Only applicable if use_custom_video_loader is True
         system_prompt: Optional[str] = "You are a helpful assistant.",
-        interleave_visuals: Optional[bool] = False,
         reasoning_prompt: Optional[str] = None,
+        tokenizer_path: Optional[str] = "/capstor/store/cscs/swissai/infra01/MLLM/llama3_vision_instruct_emu3_tokenizer",
+        emu3_min_pixels: Optional[int] = 512 * 512,
+        emu3_max_pixels: Optional[int] = 1024 * 1024,
+        max_length: Optional[int] = None,
+        ignore_max_length: Optional[bool] = False,
         **kwargs,
     ) -> None:
         super().__init__()
-        # Do not use kwargs for now
-        assert kwargs == {}, f"Unexpected kwargs: {kwargs}"
+        # Check for unexpected kwargs
+        if kwargs:
+            eval_logger.warning(f"Unexpected kwargs will be ignored: {kwargs}")
 
         # Validate attention implementation
         valid_attn_implementations = [None, "flash_attention_2", "sdpa", "eager"]
         if attn_implementation not in valid_attn_implementations:
             raise ValueError(f"attn_implementation must be one of {valid_attn_implementations}, got {attn_implementation}")
-
-        self.use_custom_video_loader = use_custom_video_loader
-        self.fps = fps
-        # if self.fps and not self.use_custom_video_loader:
-        #     raise ValueError("FPS is only applicable if use_custom_video_loader is True")
-        self.max_image_size = max_image_size
-        if self.max_image_size and not self.use_custom_video_loader:
-            raise ValueError("max_image_size is only applicable if use_custom_video_loader is True")
 
         accelerator = Accelerator()
         self.accelerator = accelerator
@@ -96,29 +97,42 @@ class LlamaEmu3Chat(lmms):
         if attn_implementation is not None:
             model_kwargs["attn_implementation"] = attn_implementation
 
-        config = AutoConfig.from_pretrained(pretrained)
-
-
         self._model = LlamaForCausalLM.from_pretrained(pretrained, **model_kwargs).eval()
-        self.max_num_frames = max_num_frames
 
         if reasoning_prompt:
             self.reasoning_prompt = reasoning_prompt.replace("\\n", "\n")
         else:
             self.reasoning_prompt = None
-        self.image_processor = AutoImageProcessor.from_pretrained("BAAI/Emu3-VisionTokenizer", trust_remote_code=True)
+
         self.image_tokenizer = EMU3ImageOnlyTokenizer(
-            text_tokenizer_path="/capstor/store/cscs/swissai/infra01/MLLM/llama3_emu3_tokenizer",
+            text_tokenizer_path=tokenizer_path,
             device=self._device,
-            min_pixels=512 * 512,
-            max_pixels=1024 * 1024,
+            min_pixels=emu3_min_pixels,
+            max_pixels=emu3_max_pixels,
         )
-        self._tokenizer = AutoTokenizer.from_pretrained("/capstor/store/cscs/swissai/infra01/MLLM/llama3_emu3_tokenizer")
+        self.image_tokenizer.to(self._device) # TODO: add image tokenizer to accelerator?
+        self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
         self.system_prompt = system_prompt
-        self.interleave_visuals = interleave_visuals
 
         self._config = self.model.config
-        self._max_length = kwargs.get("max_length", 2048)
+
+        # Set max_length with sensible defaults
+        if max_length is not None:
+            self._max_length = max_length
+        else:
+            # Try to get from model config, fallback to 8192 (Llama3B default)
+            try:
+                self._max_length = self._config.max_position_embeddings
+                eval_logger.info(f"Using max_length from model config: {self._max_length}")
+            except AttributeError:
+                self._max_length = 8192
+                eval_logger.warning(f"Could not infer max_length from model config, using default: {self._max_length}")
+
+        # Store flag to optionally ignore max_length (for testing beyond model capacity)
+        self.ignore_max_length = ignore_max_length
+        if self.ignore_max_length:
+            eval_logger.warning("ignore_max_length=True: Truncation disabled. Long sequences may cause OOM or errors.")
+
         self.batch_size_per_gpu = int(batch_size)
         self.use_cache = use_cache
 
@@ -159,7 +173,7 @@ class LlamaEmu3Chat(lmms):
 
     @property
     def eot_token_id(self):
-        return self.tokenizer.eos_token_id
+        return self.tokenizer.sft_eot_token
 
     @property
     def max_length(self):
@@ -218,6 +232,7 @@ class LlamaEmu3Chat(lmms):
             # TODO: Here i should apply a chat template, but do not have one at the moment
             batched_messages = [chat_message.to_hf_messages() for chat_message in chat_messages]
 
+            # extract images from messages
             images = []
             for messages in chat_messages:
                 image, _, _ = messages.extract_media()
@@ -227,13 +242,15 @@ class LlamaEmu3Chat(lmms):
             # Run Emu3 tokenizer to get discrete image tokens
             image_token_strs = []
             for img in images:
-                # processed_image = self.image_processor(images=img, return_tensors="pt")["pixel_values"].to(self._device)
                 with torch.inference_mode():
+                    # PIL IMG to emu3 discrete text token ids
                     emu_text = self.image_tokenizer.translate_image_to_text(img)  # returns list of token IDs
                 # convert token IDs to special token strings known to text tokenizer
                 image_token_strs.append(emu_text)
 
+            # TODO: is the format of messages correctly anticipated?
             texts = []
+            # For each msg, create a string of text inputs and image placeholders
             for msgs in batched_messages:
                 # Extract text only from each message
                 msg_text = []
@@ -247,13 +264,37 @@ class LlamaEmu3Chat(lmms):
                 texts.append(" ".join(msg_text))
 
             # Replace <image> markers with actual image token strings
+            # Track which image belongs to which text
+            image_idx = 0
             processed_texts = []
             for txt in texts:
-                for token_str in image_token_strs:
-                    txt = txt.replace("<image>", token_str, 1)
+                num_images = txt.count("<image>")
+                for _ in range(num_images):
+                    if image_idx < len(image_token_strs):
+                        txt = txt.replace("<image>", image_token_strs[image_idx], 1)
+                        image_idx += 1
                 processed_texts.append(txt)
 
-            inputs = self._tokenizer(processed_texts, padding=False, return_tensors="pt")
+            # Tokenize to get input ids with truncation if not ignoring max_length
+            if self.ignore_max_length:
+                # No truncation - allow sequences to exceed max_length (may cause errors)
+                inputs = self._tokenizer(processed_texts, padding=True, return_tensors="pt")
+            else:
+                # First, check actual lengths to log truncation statistics
+                untruncated_inputs = self._tokenizer(processed_texts, padding=False, return_tensors=None)
+                actual_lengths = [len(ids) for ids in untruncated_inputs["input_ids"]]
+                exceeded_count = sum(1 for length in actual_lengths if length > self._max_length)
+
+                if exceeded_count > 0:
+                    max_actual_length = max(actual_lengths)
+                    avg_exceeded_length = sum(length for length in actual_lengths if length > self._max_length) / exceeded_count
+                    eval_logger.warning(
+                        f"Truncation: {exceeded_count}/{len(actual_lengths)} sequences exceed max_length ({self._max_length}). "
+                        f"Max length: {max_actual_length}, Avg exceeded length: {avg_exceeded_length:.0f}"
+                    )
+
+                # Now tokenize with truncation
+                inputs = self._tokenizer(processed_texts, padding=True, max_length=self._max_length, truncation=True, return_tensors="pt")
 
             if self.device_map == "auto":
                 inputs = inputs.to("cuda")
@@ -261,15 +302,15 @@ class LlamaEmu3Chat(lmms):
                 inputs = inputs.to(self.device)
 
             # Set default generation kwargs
+            # TODO: should be able to set stop token ids or set them explicitly here?
             default_gen_kwargs = {
-                "max_new_tokens": 4096,
+                "max_new_tokens": 128,
                 "temperature": 0.0,  # Set to 0 for greedy default
                 "top_p": None,
                 "num_beams": 1,
             }
             # Update with provided kwargs
             current_gen_kwargs = {**default_gen_kwargs, **gen_kwargs}
-            pad_token_id = self.tokenizer.pad_token_id
 
             if current_gen_kwargs["temperature"] > 0:
                 current_gen_kwargs["do_sample"] = True
@@ -278,11 +319,12 @@ class LlamaEmu3Chat(lmms):
                 current_gen_kwargs["temperature"] = None
                 current_gen_kwargs["top_p"] = None
 
+            # Generate responses
             start_time = time.time()
             cont = self.model.generate(
                 **inputs,
                 eos_token_id=self.tokenizer.eos_token_id,
-                pad_token_id=pad_token_id,
+                pad_token_id=self.tokenizer.pad_token_id,
                 do_sample=current_gen_kwargs["do_sample"],
                 temperature=current_gen_kwargs["temperature"],
                 top_p=current_gen_kwargs["top_p"],
@@ -292,6 +334,7 @@ class LlamaEmu3Chat(lmms):
             )
             end_time = time.time()
 
+            # Decode responses
             generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, cont)]
             answers = self._tokenizer.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)
 
