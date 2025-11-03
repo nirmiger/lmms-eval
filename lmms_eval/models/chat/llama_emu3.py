@@ -36,7 +36,8 @@ import os
 
 # refer to swissai specific repositories on clariden
 user = os.environ["USER"]
-tokenizer_path = f"/iopsstor/scratch/cscs/{user}/benchmark-image-tokenzier"
+tokenizer_path = f"/iopsstor/scratch/cscs/{user}/benchmark-image-tokenizer"
+print(f"Appending tokenizer path: {tokenizer_path} to sys.path")
 sys.path.append(tokenizer_path)
 from vision_tokenization.utils.tokenization_emu3_image_only import EMU3ImageOnlyTokenizer
 
@@ -104,13 +105,13 @@ class LlamaEmu3Chat(lmms):
         else:
             self.reasoning_prompt = None
 
-        self.image_tokenizer = EMU3ImageOnlyTokenizer(
+        self._image_tokenizer = EMU3ImageOnlyTokenizer(
             text_tokenizer_path=tokenizer_path,
             device=self._device,
             min_pixels=emu3_min_pixels,
             max_pixels=emu3_max_pixels,
         )
-        self.image_tokenizer.to(self._device) # TODO: add image tokenizer to accelerator?
+        print(f"Tokenizer load from {tokenizer_path}...")
         self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
         self.system_prompt = system_prompt
 
@@ -173,7 +174,7 @@ class LlamaEmu3Chat(lmms):
 
     @property
     def eot_token_id(self):
-        return self.tokenizer.sft_eot_token
+        return self._tokenizer.sft_eot_token
 
     @property
     def max_length(self):
@@ -244,7 +245,7 @@ class LlamaEmu3Chat(lmms):
             for img in images:
                 with torch.inference_mode():
                     # PIL IMG to emu3 discrete text token ids
-                    emu_text = self.image_tokenizer.translate_image_to_text(img)  # returns list of token IDs
+                    emu_text = self._image_tokenizer.translate_image_to_text(img)  # returns list of token IDs
                 # convert token IDs to special token strings known to text tokenizer
                 image_token_strs.append(emu_text)
 
@@ -278,7 +279,7 @@ class LlamaEmu3Chat(lmms):
             # Tokenize to get input ids with truncation if not ignoring max_length
             if self.ignore_max_length:
                 # No truncation - allow sequences to exceed max_length (may cause errors)
-                inputs = self._tokenizer(processed_texts, padding=True, return_tensors="pt")
+                inputs = self._tokenizer(processed_texts, padding=False, return_tensors="pt")
             else:
                 # First, check actual lengths to log truncation statistics
                 untruncated_inputs = self._tokenizer(processed_texts, padding=False, return_tensors=None)
@@ -294,7 +295,7 @@ class LlamaEmu3Chat(lmms):
                     )
 
                 # Now tokenize with truncation
-                inputs = self._tokenizer(processed_texts, padding=True, max_length=self._max_length, truncation=True, return_tensors="pt")
+                inputs = self._tokenizer(processed_texts, padding=False, max_length=self._max_length, truncation=True, return_tensors="pt")
 
             if self.device_map == "auto":
                 inputs = inputs.to("cuda")
@@ -323,8 +324,8 @@ class LlamaEmu3Chat(lmms):
             start_time = time.time()
             cont = self.model.generate(
                 **inputs,
-                eos_token_id=self.tokenizer.eos_token_id,
-                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self._tokenizer.eos_token_id,
+                pad_token_id=self._tokenizer.pad_token_id,
                 do_sample=current_gen_kwargs["do_sample"],
                 temperature=current_gen_kwargs["temperature"],
                 top_p=current_gen_kwargs["top_p"],
