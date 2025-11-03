@@ -93,8 +93,8 @@ class LlamaEmu3Chat(lmms):
             min_pixels=emu3_min_pixels,
             max_pixels=emu3_max_pixels,
         )
-        print(f"Tokenizer load from {tokenizer_path}...")
-        self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        eval_logger.info(f"Tokenizer load from {tokenizer_path}...")
+        self._tokenizer = self._setup_tokenizer(tokenizer_path)
 
         self._config = self.model.config
 
@@ -135,6 +135,13 @@ class LlamaEmu3Chat(lmms):
         else:
             self._rank = 0
             self._world_size = 1
+
+    def _setup_tokenizer(self, path_or_identifier: str):
+        tokenizer = AutoTokenizer.from_pretrained(path_or_identifier)
+        if tokenizer.pad_token is None:
+            eval_logger.warning("No pad_token found in tokenizer, setting pad_token to eos_token.")
+            tokenizer.pad_token = tokenizer.eos_token
+        return tokenizer
 
     @property
     def config(self):
@@ -239,10 +246,10 @@ class LlamaEmu3Chat(lmms):
             image_idx = 0
             processed_texts = []
             for txt in texts:
-                num_images = txt.count("<image>")
+                num_images = txt.count("<|image|>")
                 for _ in range(num_images):
                     if image_idx < len(image_token_strs):
-                        txt = txt.replace("<image>", image_token_strs[image_idx], 1)
+                        txt = txt.replace("<|image|>", image_token_strs[image_idx], 1)
                         image_idx += 1
                 processed_texts.append(txt)
 
