@@ -1,23 +1,12 @@
-import base64
-import re
 import time
-from io import BytesIO
 from typing import List, Optional, Tuple, Union
 
-import numpy as np
 import torch
 from accelerate import Accelerator, DistributedType
 from loguru import logger as eval_logger
-from PIL import Image
 from tqdm import tqdm
 from transformers import (
-    AutoConfig,
-    AutoModel,
-    AutoModelForCausalLM,
-    AutoModelForImageTextToText,
-    AutoProcessor,
     AutoTokenizer,
-    AutoImageProcessor,
     LlamaForCausalLM
 )
 
@@ -54,16 +43,14 @@ class LlamaEmu3Chat(lmms):
 
     def __init__(
         self,
-        pretrained: str = "/iopsstor/scratch/cscs/nirmiger/Megatron-LM/logs/Meg-Runs/image-extension/llama3-3b-2n-8192sl-120gbsz-0.5-0.5/HF",
+        pretrained: str,
         device: Optional[str] = "cuda",
         device_map: Optional[str] = "auto",
         batch_size: Optional[Union[int, str]] = 1,
         use_cache=True,
         attn_implementation: Optional[str] = None,
-        system_prompt: Optional[str] = "You are a helpful assistant.",
-        reasoning_prompt: Optional[str] = None,
         tokenizer_path: Optional[str] = "/capstor/store/cscs/swissai/infra01/MLLM/llama3_vision_instruct_emu3_tokenizer",
-        emu3_min_pixels: Optional[int] = 512 * 512,
+        emu3_min_pixels: Optional[int] = 128 * 128,
         emu3_max_pixels: Optional[int] = 1024 * 1024,
         max_length: Optional[int] = None,
         ignore_max_length: Optional[bool] = False,
@@ -100,11 +87,6 @@ class LlamaEmu3Chat(lmms):
 
         self._model = LlamaForCausalLM.from_pretrained(pretrained, **model_kwargs).eval()
 
-        if reasoning_prompt:
-            self.reasoning_prompt = reasoning_prompt.replace("\\n", "\n")
-        else:
-            self.reasoning_prompt = None
-
         self._image_tokenizer = EMU3ImageOnlyTokenizer(
             text_tokenizer_path=tokenizer_path,
             device=self._device,
@@ -113,7 +95,6 @@ class LlamaEmu3Chat(lmms):
         )
         print(f"Tokenizer load from {tokenizer_path}...")
         self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-        self.system_prompt = system_prompt
 
         self._config = self.model.config
 
@@ -174,7 +155,7 @@ class LlamaEmu3Chat(lmms):
 
     @property
     def eot_token_id(self):
-        return self._tokenizer.sft_eot_token
+        return self._tokenizer.eos_token_id
 
     @property
     def max_length(self):
@@ -211,7 +192,7 @@ class LlamaEmu3Chat(lmms):
 
         # A dummy collate here to sort by doc id
         def _collate(x):
-            return x[2], x[2]
+            return x[0], x[0]
 
         # we group requests by their generation_kwargs,
         # so that we don't try to execute e.g. greedy sampling and temp=0.8 sampling
@@ -225,15 +206,15 @@ class LlamaEmu3Chat(lmms):
 
         for chunk in chunks:
             ctx, doc_to_messages, all_gen_kwargs, doc_id, task, split = zip(*chunk)
-            chat_messages = [doc_to_messages[0](self.task_dict[task][split][ids]) for ids, task, split in zip(doc_id, task, split)]
+            chat_messages = [doc_to_messages[idx](self.task_dict[task][split][ids]) for idx, (ids, task, split) in enumerate(zip(doc_id, task, split))]
             chat_messages: List[ChatMessages] = [ChatMessages(**{"messages": message}) for message in chat_messages]
 
             gen_kwargs = all_gen_kwargs[0]
 
-            # TODO: Here i should apply a chat template, but do not have one at the moment
+            # Convert chat messages to HF format
             batched_messages = [chat_message.to_hf_messages() for chat_message in chat_messages]
 
-            # extract images from messages
+            # Extract images from messages
             images = []
             for messages in chat_messages:
                 image, _, _ = messages.extract_media()
@@ -246,26 +227,15 @@ class LlamaEmu3Chat(lmms):
                 with torch.inference_mode():
                     # PIL IMG to emu3 discrete text token ids
                     emu_text = self._image_tokenizer.translate_image_to_text(img)  # returns list of token IDs
-                # convert token IDs to special token strings known to text tokenizer
+                # Convert token IDs to special token strings known to text tokenizer
                 image_token_strs.append(emu_text)
 
-            # TODO: is the format of messages correctly anticipated?
-            texts = []
-            # For each msg, create a string of text inputs and image placeholders
-            for msgs in batched_messages:
-                # Extract text only from each message
-                msg_text = []
-                for m in msgs:
-                    for c in m["content"]:
-                        if c["type"] == "text":
-                            msg_text.append(c["text"])
-                        elif c["type"] == "image":
-                            # insert a placeholder to replace with image tokens
-                            msg_text.append("<image>")
-                texts.append(" ".join(msg_text))
+            # Apply chat template to format messages properly with system prompts and special tokens
+            # The tokenizer's chat template outputs text with <image> placeholders where images belong
+            texts = [self._tokenizer.apply_chat_template(msg, tokenize=False, add_generation_prompt=True) for msg in batched_messages]
 
             # Replace <image> markers with actual image token strings
-            # Track which image belongs to which text
+            # Track which image belongs to which text (replaces one at a time to handle multiple images)
             image_idx = 0
             processed_texts = []
             for txt in texts:
@@ -279,7 +249,7 @@ class LlamaEmu3Chat(lmms):
             # Tokenize to get input ids with truncation if not ignoring max_length
             if self.ignore_max_length:
                 # No truncation - allow sequences to exceed max_length (may cause errors)
-                inputs = self._tokenizer(processed_texts, padding=False, return_tensors="pt")
+                inputs = self._tokenizer(processed_texts, padding=True, return_tensors="pt")
             else:
                 # First, check actual lengths to log truncation statistics
                 untruncated_inputs = self._tokenizer(processed_texts, padding=False, return_tensors=None)
@@ -295,7 +265,7 @@ class LlamaEmu3Chat(lmms):
                     )
 
                 # Now tokenize with truncation
-                inputs = self._tokenizer(processed_texts, padding=False, max_length=self._max_length, truncation=True, return_tensors="pt")
+                inputs = self._tokenizer(processed_texts, padding=True, max_length=self._max_length, truncation=True, return_tensors="pt")
 
             if self.device_map == "auto":
                 inputs = inputs.to("cuda")
